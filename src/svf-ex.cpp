@@ -26,11 +26,26 @@
  // Author: Yulei Sui,
  */
 
+#include "Graphs/IRGraph.h"
+#include "SVF-LLVM/BasicTypes.h"
 #include "SVF-LLVM/LLVMUtil.h"
+#include "SVF-LLVM/LLVMModule.h"
 #include "Graphs/SVFG.h"
+#include "SVFIR/SVFValue.h"
 #include "WPA/Andersen.h"
 #include "SVF-LLVM/SVFIRBuilder.h"
+#include "SVF-LLVM/BasicTypes.h"
 #include "Util/Options.h"
+#include "WPA/FlowSensitive.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/Support/raw_ostream.h"
+#include <system_error>
+#include "WPA/Andersen.h"
+#include "FastCluster/fastcluster.h"
+#include "Graphs/SVFGOPT.h"
+#include "MemoryModel/PointerAnalysisImpl.h"
+#include "MSSA/SVFGBuilder.h"
+#include "WPA/WPAFSSolver.h"
 
 using namespace llvm;
 using namespace std;
@@ -57,17 +72,21 @@ std::string printPts(PointerAnalysis* pta, Value* val)
     raw_string_ostream rawstr(str);
     SVFValue* svfval = LLVMModuleSet::getLLVMModuleSet()->getSVFValue(val);
 
+
     NodeID pNodeId = pta->getPAG()->getValueNode(svfval);
+
+    errs() << pNodeId  <<" " << svfval->toString() << "\n";
     const PointsTo& pts = pta->getPts(pNodeId);
     for (PointsTo::iterator ii = pts.begin(), ie = pts.end();
             ii != ie; ii++)
     {
-        rawstr << " " << *ii << " ";
+        errs() << "\t " << *ii << " ";
         PAGNode* targetObj = pta->getPAG()->getGNode(*ii);
         if(targetObj->hasValue())
-        {
-            rawstr << "(" << targetObj->getValue()->toString() << ")\t ";
+        {   
+            errs() << "(" << targetObj->getValue()->toString() << ")\t ";
         }
+        errs()<<"\n";
     }
 
     return rawstr.str();
@@ -75,133 +94,51 @@ std::string printPts(PointerAnalysis* pta, Value* val)
 }
 
 
-/*!
- * An example to query/collect all successor nodes from a ICFGNode (iNode) along control-flow graph (ICFG)
- */
-void traverseOnICFG(ICFG* icfg, const Instruction* inst)
-{
-    SVFInstruction* svfinst = LLVMModuleSet::getLLVMModuleSet()->getSVFInstruction(inst);
-
-    ICFGNode* iNode = icfg->getICFGNode(svfinst);
-    FIFOWorkList<const ICFGNode*> worklist;
-    Set<const ICFGNode*> visited;
-    worklist.push(iNode);
-
-    /// Traverse along VFG
-    while (!worklist.empty())
-    {
-        const ICFGNode* iNode = worklist.pop();
-        for (ICFGNode::const_iterator it = iNode->OutEdgeBegin(), eit =
-                    iNode->OutEdgeEnd(); it != eit; ++it)
-        {
-            ICFGEdge* edge = *it;
-            ICFGNode* succNode = edge->getDstNode();
-            if (visited.find(succNode) == visited.end())
-            {
-                visited.insert(succNode);
-                worklist.push(succNode);
-            }
-        }
-    }
-}
-
-/*!
- * An example to query/collect all the uses of a definition of a value along value-flow graph (VFG)
- */
-void traverseOnVFG(const SVFG* vfg, Value* val)
-{
-    SVFIR* pag = SVFIR::getPAG();
-    SVFValue* svfval = LLVMModuleSet::getLLVMModuleSet()->getSVFValue(val);
-
-    PAGNode* pNode = pag->getGNode(pag->getValueNode(svfval));
-    const VFGNode* vNode = vfg->getDefSVFGNode(pNode);
-    FIFOWorkList<const VFGNode*> worklist;
-    Set<const VFGNode*> visited;
-    worklist.push(vNode);
-
-    /// Traverse along VFG
-    while (!worklist.empty())
-    {
-        const VFGNode* vNode = worklist.pop();
-        for (VFGNode::const_iterator it = vNode->OutEdgeBegin(), eit =
-                    vNode->OutEdgeEnd(); it != eit; ++it)
-        {
-            VFGEdge* edge = *it;
-            VFGNode* succNode = edge->getDstNode();
-            if (visited.find(succNode) == visited.end())
-            {
-                visited.insert(succNode);
-                worklist.push(succNode);
-            }
-        }
-    }
-
-    /// Collect all LLVM Values
-    for(Set<const VFGNode*>::const_iterator it = visited.begin(), eit = visited.end(); it!=eit; ++it)
-    {
-        const VFGNode* node = *it;
-        /// can only query VFGNode involving top-level pointers (starting with % or @ in LLVM IR)
-        /// PAGNode* pNode = vfg->getLHSTopLevPtr(node);
-        /// Value* val = pNode->getValue();
-    }
-}
-
 int main(int argc, char ** argv)
 {
 
     std::vector<std::string> moduleNameVec;
+    //svf的一些命令行设置，不重要
     moduleNameVec = OptionBase::parseOptions(
             argc, argv, "Whole Program Points-to Analysis", "[options] <input-bitcode...>"
     );
-
     if (Options::WriteAnder() == "ir_annotator")
     {
         LLVMModuleSet::preProcessBCs(moduleNameVec);
     }
-
+    //读取ir文件并转换为svfmodule
     SVFModule* svfModule = LLVMModuleSet::buildSVFModule(moduleNameVec);
 
+    //获取llvm module
+    Module* llvmModule = LLVMModuleSet::getLLVMModuleSet()->getMainLLVMModule();
     /// Build Program Assignment Graph (SVFIR)
     SVFIRBuilder builder(svfModule);
+    /// 构建pag
     SVFIR* pag = builder.build();
-
-    /// Create Andersen's pointer analysis
     Andersen* ander = AndersenWaveDiff::createAndersenWaveDiff(pag);
+    FlowSensitive* point_to_analysis = FlowSensitive::createFSWPA(pag);
+    point_to_analysis->analyze();
 
-    /// Query aliases
-    /// aliasQuery(ander,value1,value2);
+    std::vector<llvm::Value*> values;
+    // 遍历模块中的所有函数
+    for (auto& function : llvmModule->getFunctionList()) {
+        // 遍历函数中的所有基本块
+        for (auto& basicBlock : function) {
+            // 遍历基本块中的所有指令
+            for (auto& instruction : basicBlock) {
+                // 将指令本身加入向量
+                values.push_back(&instruction);
 
-    /// Print points-to information
-    /// printPts(ander, value1);
-
-    /// Call Graph
-    PTACallGraph* callgraph = ander->getPTACallGraph();
-
-    /// ICFG
-    ICFG* icfg = pag->getICFG();
-
-    /// Value-Flow Graph (VFG)
-    VFG* vfg = new VFG(callgraph);
-
-    /// Sparse value-flow graph (SVFG)
-    SVFGBuilder svfBuilder;
-    SVFG* svfg = svfBuilder.buildFullSVFG(ander);
-
-    /// Collect uses of an LLVM Value
-    /// traverseOnVFG(svfg, value);
-
-    /// Collect all successor nodes on ICFG
-    /// traverseOnICFG(icfg, value);
-
-    // clean up memory
-    delete vfg;
-    AndersenWaveDiff::releaseAndersenWaveDiff();
-    SVFIR::releaseSVFIR();
-
-    LLVMModuleSet::getLLVMModuleSet()->dumpModulesToFile(".svf.bc");
-    SVF::LLVMModuleSet::releaseLLVMModuleSet();
-
-    llvm::llvm_shutdown();
+                // 遍历指令的操作数
+                for (auto& operand : instruction.operands()) {
+                    values.push_back(operand);
+                }
+            }
+        }
+    }
+    for(auto llvmvalue: values) {
+        printPts(point_to_analysis,llvmvalue);
+    }
     return 0;
 }
 
